@@ -1,0 +1,19 @@
+{
+  "defaults": {
+    "min_score": 70,
+    "remove_watermark": true
+  },
+  "videos": [
+    {
+      "url": "https://youtu.be/7weh4mCzFNM"
+    }
+  ],
+  "_help": [
+    "Add video links to \"videos\", then run: python3 skill/scripts/make_shorts.py",
+    "A link can be plain text, or an object with its own settings, e.g.",
+    "{\"url\": \"https://youtu.be/...\", \"clips\": 5, \"mode\": \"visual\"}",
+    "By default every strong moment becomes a short. Allowed settings: clips (a number, or \"all\"), min_score, min_seconds, max_seconds, mode (auto|speech|visual), format (vertical|square|horizontal), captions (true|false), hook (true|false), remove_watermark (true|false: removes a channel watermark from a corner, only for footage you may republish without it), name.",
+    "\"defaults\": {...} applies the same settings to every link.",
+    "Finished links are remembered in output/processed.json and skipped next time; add \"redo\": true to a link to make its shorts again."
+  ]
+}
