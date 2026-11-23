@@ -77,7 +77,7 @@ Options:
 | `--min-score` | 70 | with `all`: how strong (0-100) a moment must score to become a short. Raise it for fewer, stronger shorts; lower it for more |
 | `--min-seconds` / `--max-seconds` | 20 / 45 | clip length band |
 | `--mode auto\|speech\|visual` | auto | how highlights are found (below) |
-| `--model` | claude-opus-5-5 | Claude CLI model that analyses the video (Opus 5.5 by default). `sonnet` or `haiku` are faster and lighter on the subscription's usage limits |
+| `--model` | claude-fable-5-2 | Claude CLI model that analyses the video (Fable 5.2 by default). `sonnet` or `haiku` are faster and lighter on the subscription's usage limits |
 | `--whisper-model` | small | speech model; use `base` or `tiny` on a machine with 8 GB RAM or when transcription is slow |
 | `--format` | vertical | `vertical` 9:16, `square` 1:1, `horizontal` 16:9 |
 | `--no-captions`, `--no-hook` | off | skip burned subtitles / the hook text overlay |
@@ -85,6 +85,7 @@ Options:
 | `--no-facecam` | off | turn off the stacked game + streamer-camera layout |
 | `--no-full-frame` | full frame on | by default the whole 16:9 source frame is shown at full width with blur above and below, so nothing at the edges is cut (url.json: `"full_frame": true`). `--no-full-frame` goes back to crops that fill more of the 9:16 frame but trim the sides |
 | `--no-remove-watermark` | removal on | by default the script will find a channel watermark burned into a corner of the source and rebuild those pixels in every short (url.json: `"remove_watermark": true`). The user has confirmed they hold the rights to their footage; pass `--no-remove-watermark` (url.json: `"remove_watermark": false`) to keep the mark |
+| `--no-clean-source` | clean-up on | by default black cinematic bars and the source's own burned-in subtitles (game dialogue subtitles) are cut off the source before the shorts are made, so a short fills the frame and carries one layer of captions (url.json: `"clean_source": true`). Costs one re-encode of the source, only when something is found |
 | `--keep-source` | off | keep the downloaded video and the `work/` intermediates; by default both are deleted once every short has rendered |
 | `--name` | title + time | run folder name under `output/` |
 

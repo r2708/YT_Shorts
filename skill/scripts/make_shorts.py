@@ -38,7 +38,7 @@ SOURCES = OUTPUT / "_sources"
 QUEUE = ROOT / "url.json"
 STATE = OUTPUT / "processed.json"
 LOCK = OUTPUT / ".make_shorts.lock"
-DEFAULT_MODEL = "claude-opus-5-5"  # Opus 5.5 picks the moments, titles and hooks
+DEFAULT_MODEL = "claude-fable-5-2"  # Fable 5.2 picks the moments, titles and hooks
 MAX_CLIPS = 40  # ceiling on shorts from one video, also in "all" mode
 
 QUEUE_TEMPLATE = {
@@ -49,7 +49,8 @@ QUEUE_TEMPLATE = {
         "A link can be plain text, or an object with its own settings, e.g.",
         "{\"url\": \"https://youtu.be/...\", \"clips\": 5, \"mode\": \"visual\"}",
         "By default every strong moment becomes a short. Allowed settings: clips (a number, or \"all\"), min_score, min_seconds, max_seconds, mode (auto|speech|visual), "
-        "format (vertical|square|horizontal), captions (true|false), hook (true|false), remove_watermark (true|false: removes a channel watermark from a corner, only for footage you may republish without it), name.",
+        "format (vertical|square|horizontal), captions (true|false), hook (true|false), remove_watermark (true|false: removes a channel watermark from a corner, only for footage you may republish without it), "
+        "clean_source (true|false: cuts black cinematic bars and the game's own subtitles off the source first), name.",
         "\"defaults\": {...} applies the same settings to every link.",
         "Finished links are remembered in output/processed.json and skipped next time; "
         "add \"redo\": true to a link to make its shorts again.",
@@ -60,7 +61,7 @@ QUEUE_TEMPLATE = {
 ENTRY_KEYS = {"clips": "clips", "min_score": int, "min_seconds": int, "max_seconds": int, "mode": str,
               "format": str, "captions": bool, "hook": bool, "name": str,
               "hook_seconds": float, "facecam": bool, "full_frame": bool, "model": str,
-              "remove_watermark": bool}
+              "remove_watermark": bool, "clean_source": bool}
 
 
 class RunError(Exception):
@@ -293,10 +294,19 @@ def make_shorts(source_arg: str, opts: argparse.Namespace, ff_dir: str | None) -
     # The pipeline names its files after the input, so give it a short stable name.
     job_source = work / "source.mp4"
     if not job_source.exists():
-        try:
-            os.link(source, job_source)
-        except OSError:
-            shutil.copy2(source, job_source)
+        cleaned = False
+        if opts.clean_source and info["width"] > info["height"]:
+            try:
+                cleaned = clean_source(source, job_source, info, opts.model,
+                                       check_subtitles=not opts.no_captions)
+            except RunError as e:  # the shorts can still be made from the source as it is
+                log(f"NOTE: the source was not cleaned ({e}); using it as it is.")
+                job_source.unlink(missing_ok=True)
+        if not cleaned:
+            try:
+                os.link(source, job_source)
+            except OSError:
+                shutil.copy2(source, job_source)
 
     env = dict(os.environ)
     if ff_dir:
@@ -341,7 +351,8 @@ def make_shorts(source_arg: str, opts: argparse.Namespace, ff_dir: str | None) -
     env.pop("GEMINI_API_KEY", None)
     env.pop("REMOVELOGO_MASK", None)
     if opts.remove_watermark:
-        mask = find_watermark(source, work / "watermark_mask.png")
+        # On the pipeline's own input: a cleaned source has another height.
+        mask = find_watermark(job_source, work / "watermark_mask.png")
         if mask:
             env["REMOVELOGO_MASK"] = str(mask)
     if opts.mode == "visual":
@@ -472,6 +483,164 @@ def make_shorts(source_arg: str, opts: argparse.Namespace, ff_dir: str | None) -
     return result
 
 
+# --- source clean-up: black bars and the game's own subtitles -------------------
+
+SAMPLES = 12            # stills spread over the source, for both checks
+BAR_MIN = 0.015         # a bar thinner than this share of the height is not a bar
+BAR_PRESENCE = 0.9      # bars must be in this share of the stills: cutting them
+                        # from a video that only has them in cutscenes would cut
+                        # real picture (the HUD) from the gameplay
+SUB_PRESENCE = 0.4      # subtitles come and go with speech
+SUB_MARGIN = 0.02       # head-room above the highest subtitle line seen
+SUB_HIGHEST = 0.75      # never cut more than the bottom quarter
+SUB_LOWEST = 0.97       # below this the band is a sliver not worth cutting
+
+SUBTITLE_SCHEMA = {
+    "type": "object", "required": ["frames"], "additionalProperties": False,
+    "properties": {"frames": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["frame", "subtitle_top"],
+        "properties": {"frame": {"type": "integer"},
+                       "subtitle_top": {"type": ["number", "null"]}}}}},
+}
+SUBTITLE_PROMPT = """Each image is a frame sampled from the same landscape
+video, in order. For EVERY image, look only for SUBTITLES burned into the
+picture: lines of dialogue text near the bottom that transcribe what is being
+said (often with a speaker name, e.g. "Cal: ..."). A game HUD, a minimap, a
+score, a button prompt, a channel logo, a title card or a sign inside the scene
+is NOT a subtitle.
+
+Return one entry per image: "frame" is its number (1-based), "subtitle_top" is
+how far down the image the TOP edge of the subtitle text sits, as a fraction of
+the image height (0 = top edge, 1 = bottom edge), or null when that image has
+no subtitle.
+
+Answer ONLY with a JSON object: {"frames": [{"frame": 1, "subtitle_top": ...}]}."""
+
+
+def _sample_times(duration: float, n: int = SAMPLES) -> list[float]:
+    return [duration * (i + 0.5) / n for i in range(n)]
+
+
+def find_black_bars(source: Path, info: dict) -> tuple[int, int]:
+    """(top, bottom) height in pixels of black bars burned into the source.
+
+    Cinematic cutscenes are often letterboxed inside the 16:9 frame; reframed
+    to 9:16 those bars end up as black strips in every short. (0, 0) unless
+    nearly every still has them."""
+    w, h = info["width"], info["height"]
+    readings = []
+    for t in _sample_times(info["duration"]):
+        try:
+            res = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{t:.2f}", "-i", str(source),
+                 "-t", "1.5", "-an", "-vf", "cropdetect=limit=24:round=2:reset=0", "-f", "null", "-"],
+                capture_output=True, text=True, errors="replace", timeout=180)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        found = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", res.stderr or "")
+        if not found:
+            continue
+        cw, ch, _, cy = map(int, found[-1])
+        if cw < w * 0.9 or ch < h * 0.6:
+            continue  # a dark scene, not a reading of the bars
+        readings.append((cy, h - ch - cy))
+    barred = [(t, b) for t, b in readings if t >= h * BAR_MIN and b >= h * BAR_MIN]
+    if len(readings) < SAMPLES // 2 or len(barred) < len(readings) * BAR_PRESENCE:
+        return 0, 0
+    # The thinnest bar seen, plus 2 px so no grey edge line is left.
+    return min(t for t, _ in barred) + 2, min(b for _, b in barred) + 2
+
+
+def find_source_subtitles(source: Path, info: dict, crop: str, model: str) -> float | None:
+    """Top of the source's own subtitle band, as a share (0..1) of the picture
+    that `crop` keeps, or None when it has no subtitle track.
+
+    The pipeline burns its own captions; with the game's subtitles left in, a
+    short carries two layers of text, the game's cut off at both sides."""
+    with tempfile.TemporaryDirectory(prefix="shorts-frames-") as tmp:
+        images = []
+        for i, t in enumerate(_sample_times(info["duration"])):
+            jpg = Path(tmp, f"frame_{i + 1:02d}.jpg")
+            try:
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", str(source),
+                                "-frames:v", "1", "-vf", f"{crop},scale=1024:-2", "-q:v", "4", str(jpg)],
+                               capture_output=True, timeout=180)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if jpg.is_file() and jpg.stat().st_size:
+                images.append((f"Frame {len(images) + 1}", jpg))
+        if len(images) < SAMPLES // 2:
+            return None
+        parsed = _claude_json(SUBTITLE_PROMPT, SUBTITLE_SCHEMA, model, images=images)
+    tops = []
+    for f in (parsed.get("frames") or [])[:len(images)]:
+        v = f.get("subtitle_top") if isinstance(f, dict) else None
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < 1:
+            tops.append(float(v))
+    if len(tops) < len(images) * SUB_PRESENCE:
+        return None
+    band = max(SUB_HIGHEST, min(tops) - SUB_MARGIN)
+    return None if band > SUB_LOWEST else band
+
+
+def clean_source(source: Path, dest: Path, info: dict, model: str, check_subtitles: bool = True) -> bool:
+    """Write to `dest` a copy of the source without its black bars and without
+    its own burned-in subtitles. False when there is nothing to cut (no copy made)."""
+    w, h = info["width"], info["height"]
+    log("Checking the source for black bars and its own subtitles...")
+    top, bottom = find_black_bars(source, info)
+    picture = h - top - bottom
+    if top or bottom:
+        log(f"   Black bars found ({top}px top, {bottom}px bottom); they are cut off.")
+    band = None
+    if check_subtitles:
+        try:
+            band = find_source_subtitles(source, info, f"crop={w}:{picture}:0:{top}", model)
+        except RunError as e:
+            log(f"   NOTE: subtitle check failed ({e}); the source's subtitles, if any, stay.")
+        if band:
+            log(f"   The source has its own subtitles; the picture below {band:.0%} is cut off "
+                f"so only our captions show.")
+    keep = int(picture * (band or 1.0)) // 2 * 2
+    if keep >= h - 1:
+        log("   Nothing to cut.")
+        return False
+    tmp = dest.with_name(dest.stem + ".cleaning.mp4")
+    encoders = [["-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p"]]
+    if sys.platform == "darwin":  # hardware encoder first: several times faster on a long source
+        encoders.insert(0, ["-c:v", "h264_videotoolbox", "-q:v", "78", "-pix_fmt", "yuv420p"])
+    try:
+        for enc in encoders:
+            log(f"   Re-encoding the source at {w}x{keep} ({enc[1]})...")
+            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1",
+                   "-i", str(source), "-vf", f"crop={w}:{keep}:0:{top}", "-map", "0:v:0", "-map", "0:a?",
+                   *enc, "-c:a", "copy", "-movflags", "+faststart", str(tmp)]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, errors="replace")
+            try:
+                step = 0
+                for line in proc.stdout:
+                    m = re.match(r"out_time_(?:us|ms)=(\d+)", line)
+                    if m and info["duration"]:
+                        pct = min(100, int(int(m.group(1)) / 1e6 / info["duration"] * 100))
+                        if pct // 10 > step:
+                            step = pct // 10
+                            log(f"   Cleaning the source: {step * 10}%")
+                err = proc.stderr.read()
+                code = proc.wait()
+            except BaseException:
+                proc.kill()
+                raise
+            if code == 0 and probe(tmp)["duration"] >= info["duration"] - 2:
+                tmp.replace(dest)
+                return True
+            log(f"   NOTE: {enc[1]} failed ({(err or '').strip()[-200:] or 'incomplete file'}).")
+        raise RunError("ffmpeg could not re-encode the source")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def find_watermark(source: Path, mask_path: Path) -> Path | None:
     """Locate a channel watermark burned into a corner of the source and write
     the mask the pipeline uses to rebuild those pixels. None when none is found.
@@ -567,16 +736,33 @@ def _clip_transcript(meta: dict, start, end, limit: int = 1500) -> str:
     return " ".join(w for w in words if w)[:limit]
 
 
-def _claude_json(prompt: str, schema: dict, model: str) -> dict:
-    """One isolated `claude -p` call that must answer JSON matching `schema`."""
+def _claude_json(prompt: str, schema: dict, model: str,
+                 images: list[tuple[str, Path]] | None = None) -> dict:
+    """One isolated `claude -p` call that must answer JSON matching `schema`.
+
+    `images`: (label, file) pairs the model must look at, in order; they are
+    copied next to the call and read with its Read tool, the only tool it gets."""
     binary = os.environ.get("CLAUDE_CLI_BIN") or "claude"
+    tools = "Read" if images else ""
     cmd = [binary, "-p", "--safe-mode", "--strict-mcp-config", "--no-session-persistence",
-           "--output-format", "json", "--model", model, "--tools", "",
+           "--output-format", "json", "--model", model, "--tools", tools,
            "--json-schema", json.dumps(schema)]
+    if tools:
+        cmd += ["--allowedTools", tools]
     env = dict(os.environ)
     for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"):
         env.pop(k, None)
     with tempfile.TemporaryDirectory(prefix="claude-meta-") as cwd:
+        if images:
+            lines = []
+            for i, (label, path) in enumerate(images):
+                name = f"img_{i:03d}{Path(path).suffix or '.jpg'}"
+                shutil.copy2(path, Path(cwd, name))
+                lines.append(f"- {label}: ./{name}")
+            prompt = ("You are given image files in the current directory. Use the Read "
+                      "tool to LOOK at every one of them, in order, before answering "
+                      "(read several per turn). Do not answer from the file names.\n"
+                      + "\n".join(lines) + "\n\n" + prompt)
         try:
             res = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
                                  cwd=cwd, env=env, timeout=900)
@@ -932,6 +1118,11 @@ def main() -> int:
                     help="find a channel watermark burned into a corner of the video and remove it "
                          "from the shorts (default: on; --no-remove-watermark keeps it). "
                          "Only for footage you may republish without it")
+    ap.add_argument("--clean-source", action=argparse.BooleanOptionalAction, default=True,
+                    help="cut black cinematic bars and the source's own burned-in subtitles off "
+                         "before the shorts are made, so they fill the frame and carry one layer "
+                         "of captions (default: on; costs one re-encode of the source when it "
+                         "finds something to cut)")
     ap.add_argument("--keep-source", action="store_true",
                     help="keep the downloaded video and working files after the shorts are made")
     ap.add_argument("--no-metadata", action="store_true",
